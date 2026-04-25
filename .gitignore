@@ -1,3 +1,7 @@
 .zig-cache/
 zig-out/
 *.o
+
+.envrc
+.direnv/
+.DS_Store
