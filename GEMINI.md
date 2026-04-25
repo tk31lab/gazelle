@@ -51,3 +51,8 @@ The project is identified as the `gazelle` module. Always use `@import("gazelle"
 
 ### Testing
 Add unit tests within the relevant source files or in separate test blocks. Ensure `zig build test` passes before committing changes.
+
+## Development Workflow
+- **Agent Context**: Additional project-specific notes, design documents, or research materials that should not be committed to Git can be placed in the `.gemini/` directory. The agent should check this directory for supplemental context when needed.
+- **Environment**: Always work within the `nix develop` shell or ensure `libpq` is available in the library path.
+

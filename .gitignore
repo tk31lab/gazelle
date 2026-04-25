@@ -5,3 +5,4 @@ zig-out/
 .envrc
 .direnv/
 .DS_Store
+.gemini/
