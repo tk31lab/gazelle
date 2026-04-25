@@ -16,6 +16,8 @@ pub const Config = struct {
     slot_name: [:0]const u8,
     pub_name: [:0]const u8,
     output_format: OutputFormat = .text,
+    include_tables: ?[]const []const u8 = null,
+    exclude_tables: ?[]const []const u8 = null,
 
     pub const OutputFormat = enum {
         text,
@@ -51,6 +53,25 @@ pub const Watcher = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.relations.deinit();
+    }
+
+    fn shouldWatch(self: *Watcher, table_name: []const u8) bool {
+        // ブラックリスト形式のチェック
+        if (self.config.exclude_tables) |excludes| {
+            for (excludes) |exclude| {
+                if (std.mem.eql(u8, table_name, exclude)) return false;
+            }
+        }
+
+        // ホワイトリスト形式のチェック
+        if (self.config.include_tables) |includes| {
+            for (includes) |include| {
+                if (std.mem.eql(u8, table_name, include)) return true;
+            }
+            return false;
+        }
+
+        return true;
     }
 
     /// 指定されたミリ秒待機するが、シグナル（Ctrl+C）を受け取ったら即座に中断して true を返す
@@ -139,11 +160,20 @@ pub const Watcher = struct {
                             const logical_msg_type = xlog.data[0];
                             switch (logical_msg_type) {
                                 'R' => {
-                                    const rel = try gazelle.protocol.Relation.parse(self.allocator, xlog.data);
-                                    if (self.relations.getPtr(rel.id)) |old_rel| {
-                                        old_rel.deinit(self.allocator);
+                                    var rel = try gazelle.protocol.Relation.parse(self.allocator, xlog.data);
+                                    if (self.shouldWatch(rel.name)) {
+                                        if (self.relations.getPtr(rel.id)) |old_rel| {
+                                            old_rel.deinit(self.allocator);
+                                        }
+                                        try self.relations.put(rel.id, rel);
+                                    } else {
+                                        // 監視対象外の場合はマップから削除し、メモリを解放する
+                                        if (self.relations.fetchRemove(rel.id)) |entry| {
+                                            var v = entry.value;
+                                            v.deinit(self.allocator);
+                                        }
+                                        rel.deinit(self.allocator);
                                     }
-                                    try self.relations.put(rel.id, rel);
                                 },
                                 'I' => {
                                     const insert = try gazelle.protocol.Insert.parse(aa, xlog.data);
@@ -212,8 +242,12 @@ pub fn main(init: std.process.Init) !void {
         .pub_name = "gazelle_pub",
     };
 
+    const arena_allocator = init.arena.allocator();
+    var include_tables: std.ArrayList([]const u8) = .empty;
+    var exclude_tables: std.ArrayList([]const u8) = .empty; // std.ArrayList([]const u8).init(init.arena.allocator());
+
     // 引数のパース (Zig 0.16.0 Juicy Main)
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const args = try init.minimal.args.toSlice(arena_allocator);
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -226,6 +260,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--pub")) {
             i += 1;
             if (i < args.len) config.pub_name = args[i];
+        } else if (std.mem.eql(u8, arg, "--table")) {
+            i += 1;
+            if (i < args.len) try include_tables.append(arena_allocator, args[i]);
+        } else if (std.mem.eql(u8, arg, "--exclude")) {
+            i += 1;
+            if (i < args.len) try exclude_tables.append(arena_allocator, args[i]);
         } else if (std.mem.eql(u8, arg, "--json")) {
             config.output_format = .json;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -233,16 +273,21 @@ pub fn main(init: std.process.Init) !void {
                 \\Usage: gazelle [options]
                 \\
                 \\Options:
-                \\  --dsn <dsn>    PostgreSQL connection string (default: host=localhost ...)
-                \\  --slot <name>   Replication slot name (default: gazelle_slot)
-                \\  --pub <name>    Publication name (default: gazelle_pub)
-                \\  --json          Output in JSON Lines format
-                \\  -h, --help      Show this help
+                \\  --dsn <dsn>      PostgreSQL connection string (default: host=localhost ...)
+                \\  --slot <name>     Replication slot name (default: gazelle_slot)
+                \\  --pub <name>      Publication name (default: gazelle_pub)
+                \\  --table <name>    Include table in monitoring (can be specified multiple times)
+                \\  --exclude <name>  Exclude table from monitoring (can be specified multiple times)
+                \\  --json            Output in JSON Lines format
+                \\  -h, --help        Show this help
                 \\
             , .{});
             return;
         }
     }
+
+    if (include_tables.items.len > 0) config.include_tables = include_tables.items;
+    if (exclude_tables.items.len > 0) config.exclude_tables = exclude_tables.items;
 
     var watcher = Watcher.init(allocator, init.io, config);
     defer watcher.deinit();
