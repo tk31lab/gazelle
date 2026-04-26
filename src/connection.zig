@@ -77,10 +77,14 @@ pub const Connection = struct {
     }
 
     /// レプリケーションを開始する
-    pub fn startReplication(self: *Connection, slot_name: [:0]const u8, publication_name: [:0]const u8) !void {
+    pub fn startReplication(self: *Connection, slot_name: [:0]const u8, publication_name: [:0]const u8, lsn: u64) !void {
         var query_buf: [512]u8 = undefined;
         // proto_version '2' は PostgreSQL 14以降で推奨される論理複製のプロトコルバージョン
-        const query = try std.fmt.bufPrintZ(&query_buf, "START_REPLICATION SLOT {s} LOGICAL 0/0 (proto_version '2', publication_names '{s}')", .{ slot_name, publication_name });
+        // LSN が 0 の場合は 0/0 (最初から) を指定する。指定がある場合は X/Y 形式で指定する。
+        const query = if (lsn == 0)
+            try std.fmt.bufPrintZ(&query_buf, "START_REPLICATION SLOT {s} LOGICAL 0/0 (proto_version '2', publication_names '{s}')", .{ slot_name, publication_name })
+        else
+            try std.fmt.bufPrintZ(&query_buf, "START_REPLICATION SLOT {s} LOGICAL {X}/{X} (proto_version '2', publication_names '{s}')", .{ slot_name, @as(u32, @intCast(lsn >> 32)), @as(u32, @intCast(lsn & 0xFFFFFFFF)), publication_name });
 
         const res = pg.PQexec(self.handle, query);
         defer pg.PQclear(res);
