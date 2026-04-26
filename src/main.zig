@@ -87,7 +87,7 @@ pub const Watcher = struct {
         if (lsn == 0) return;
 
         // アトミックな書き込みのために一時ファイルを作成
-        var tmp_path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+        var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path});
         const is_absolute = std.Io.Dir.path.isAbsolute(path);
         {
