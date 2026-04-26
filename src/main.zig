@@ -312,12 +312,39 @@ pub fn main(init: std.process.Init) !void {
     var include_tables: std.ArrayList([]const u8) = .empty;
     var exclude_tables: std.ArrayList([]const u8) = .empty;
 
-    // 引数のパース (Zig 0.16.0 Juicy Main)
+    // 1次パース: --config を探す
     const args = try init.minimal.args.toSlice(arena_allocator);
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--config")) {
+            i += 1;
+            if (i < args.len) {
+                const config_path = args[i];
+                const file = try std.Io.Dir.cwd().openFile(init.io, config_path, .{});
+                defer file.close(init.io);
+
+                var buf: [1024 * 16]u8 = undefined; // 16KB max config
+                var file_reader = file.reader(init.io, &buf);
+                const r = &file_reader.interface;
+                const bytes_read = try r.readSliceShort(&buf);
+                
+                const parsed = try std.json.parseFromSlice(Config, arena_allocator, buf[0..bytes_read], .{
+                    .ignore_unknown_fields = true,
+                    .allocate = .alloc_always,
+                });
+                // 設定ファイルの内容を反映（後続の引数で上書きされる）
+                config = parsed.value;
+            }
+        }
+    }
+
+    // 2次パース: その他の引数で上書き
+    i = 1;
+    while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--dsn")) {
+        if (std.mem.eql(u8, arg, "--config")) {
+            i += 1; // 既に対処済み
+        } else if (std.mem.eql(u8, arg, "--dsn")) {
             i += 1;
             if (i < args.len) config.conninfo = args[i];
         } else if (std.mem.eql(u8, arg, "--slot")) {
@@ -342,6 +369,7 @@ pub fn main(init: std.process.Init) !void {
                 \\Usage: gazelle [options]
                 \\
                 \\Options:
+                \\  --config <file>   Load configuration from a JSON file
                 \\  --dsn <dsn>      PostgreSQL connection string (default: host=localhost ...)
                 \\  --slot <name>     Replication slot name (default: gazelle_slot)
                 \\  --pub <name>      Publication name (default: gazelle_pub)
