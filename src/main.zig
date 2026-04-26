@@ -18,6 +18,7 @@ pub const Config = struct {
     output_format: OutputFormat = .text,
     include_tables: ?[]const []const u8 = null,
     exclude_tables: ?[]const []const u8 = null,
+    pos_file: ?[]const u8 = null,
 
     pub const OutputFormat = enum {
         text,
@@ -53,6 +54,61 @@ pub const Watcher = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.relations.deinit();
+    }
+
+    pub fn loadPosition(self: *Watcher) u64 {
+        const path = self.config.pos_file orelse return 0;
+        const is_absolute = std.Io.Dir.path.isAbsolute(path);
+        const file = if (is_absolute)
+            std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch return 0
+        else
+            std.Io.Dir.cwd().openFile(self.io, path, .{}) catch return 0;
+        defer file.close(self.io);
+
+        var buf: [64]u8 = undefined;
+        var file_reader = file.reader(self.io, &buf);
+        const r = &file_reader.interface;
+        const bytes_read = r.readSliceShort(&buf) catch return 0;
+        const content = std.mem.trim(u8, buf[0..bytes_read], " \n\r\t");
+
+        // X/Y 形式のパース
+        var it = std.mem.splitScalar(u8, content, '/');
+        const high_str = it.next() orelse return 0;
+        const low_str = it.next() orelse return 0;
+
+        const high = std.fmt.parseInt(u32, high_str, 16) catch return 0;
+        const low = std.fmt.parseInt(u32, low_str, 16) catch return 0;
+
+        return (@as(u64, high) << 32) | low;
+    }
+
+    pub fn savePosition(self: *Watcher, lsn: u64) !void {
+        const path = self.config.pos_file orelse return;
+        if (lsn == 0) return;
+
+        // アトミックな書き込みのために一時ファイルを作成
+        var tmp_path_buf: [256]u8 = undefined;
+        const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path});
+        const is_absolute = std.Io.Dir.path.isAbsolute(path);
+        {
+            const file = if (is_absolute)
+                try std.Io.Dir.createFileAbsolute(self.io, tmp_path, .{})
+            else
+                try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{});
+            defer file.close(self.io);
+
+            var buf: [1024]u8 = undefined;
+            var file_writer = file.writer(self.io, &buf);
+            const writer = &file_writer.interface;
+            try writer.print("{X}/{X}\n", .{ @as(u32, @intCast(lsn >> 32)), @as(u32, @intCast(lsn & 0xFFFFFFFF)) });
+            try writer.flush();
+            try file.sync(self.io);
+        }
+        if (is_absolute) {
+            try std.Io.Dir.renameAbsolute(tmp_path, path, self.io);
+        } else {
+            try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, self.io);
+        }
     }
 
     fn shouldWatch(self: *Watcher, table_name: []const u8) bool {
@@ -126,7 +182,12 @@ pub const Watcher = struct {
             // レプリケーションスロットの作成（既にある場合はエラーになるが無視）
             _ = conn.createReplicationSlot(self.config.slot_name) catch {};
 
-            conn.startReplication(self.config.slot_name, self.config.pub_name) catch |err| {
+            const start_lsn = self.loadPosition();
+            if (start_lsn != 0) {
+                std.debug.print("Resuming replication from LSN: {X}/{X}\n", .{ @as(u32, @intCast(start_lsn >> 32)), @as(u32, @intCast(start_lsn & 0xFFFFFFFF)) });
+            }
+
+            conn.startReplication(self.config.slot_name, self.config.pub_name, start_lsn) catch |err| {
                 std.debug.print("Start replication failed: {s}. Reconnecting...\n", .{@errorName(err)});
                 if (waitInterruptible(self.io, retry_delay_ms)) break :outer;
                 continue :outer;
@@ -135,7 +196,7 @@ pub const Watcher = struct {
             std.debug.print("Connection established. Monitoring logical replication...\n", .{});
             retry_delay_ms = 1000; // 成功したのでリセット
 
-            var last_wal_end: u64 = 0;
+            var last_wal_end: u64 = start_lsn;
 
             while (!should_exit.load(.monotonic)) {
                 _ = arena.reset(.retain_capacity);
@@ -155,6 +216,8 @@ pub const Watcher = struct {
                     'w' => {
                         const xlog = try gazelle.protocol.XLogData.parse(raw_data);
                         last_wal_end = xlog.wal_end;
+                        // 進行状況を保存
+                        self.savePosition(last_wal_end) catch {};
 
                         if (xlog.data.len > 0) {
                             const logical_msg_type = xlog.data[0];
@@ -202,6 +265,9 @@ pub const Watcher = struct {
                     'k' => {
                         const keepalive = try gazelle.protocol.Keepalive.parse(raw_data);
                         last_wal_end = keepalive.wal_end;
+                        // 進行状況を保存
+                        self.savePosition(last_wal_end) catch {};
+
                         if (keepalive.reply_requested) {
                             conn.sendStatusUpdate(last_wal_end) catch |err| {
                                 std.debug.print("Failed to send status update: {}. Reconnecting...\n", .{err});
@@ -244,7 +310,7 @@ pub fn main(init: std.process.Init) !void {
 
     const arena_allocator = init.arena.allocator();
     var include_tables: std.ArrayList([]const u8) = .empty;
-    var exclude_tables: std.ArrayList([]const u8) = .empty; // std.ArrayList([]const u8).init(init.arena.allocator());
+    var exclude_tables: std.ArrayList([]const u8) = .empty;
 
     // 引数のパース (Zig 0.16.0 Juicy Main)
     const args = try init.minimal.args.toSlice(arena_allocator);
@@ -266,6 +332,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--exclude")) {
             i += 1;
             if (i < args.len) try exclude_tables.append(arena_allocator, args[i]);
+        } else if (std.mem.eql(u8, arg, "--pos")) {
+            i += 1;
+            if (i < args.len) config.pos_file = args[i];
         } else if (std.mem.eql(u8, arg, "--json")) {
             config.output_format = .json;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -278,6 +347,7 @@ pub fn main(init: std.process.Init) !void {
                 \\  --pub <name>      Publication name (default: gazelle_pub)
                 \\  --table <name>    Include table in monitoring (can be specified multiple times)
                 \\  --exclude <name>  Exclude table from monitoring (can be specified multiple times)
+                \\  --pos <file>      File to persist the last WAL position (LSN)
                 \\  --json            Output in JSON Lines format
                 \\  -h, --help        Show this help
                 \\
